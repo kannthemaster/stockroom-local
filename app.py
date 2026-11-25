@@ -1,4 +1,4 @@
-import json
+﻿import json
 import sqlite3
 import sys
 import webbrowser
@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS billed(invoice INTEGER PRIMARY KEY REFERENCES doc, bi
 CREATE TABLE IF NOT EXISTS payment(id INTEGER PRIMARY KEY, invoice INTEGER REFERENCES doc, amount INTEGER NOT NULL, created TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS request(token TEXT PRIMARY KEY,result TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS settings(id INTEGER PRIMARY KEY,name TEXT NOT NULL,address TEXT NOT NULL);
-INSERT OR IGNORE INTO settings VALUES(1,'ร้านค้าของฉัน','');
+CREATE TABLE IF NOT EXISTS customer(id INTEGER PRIMARY KEY, name TEXT NOT NULL, address TEXT NOT NULL, phone TEXT NOT NULL);
+INSERT OR IGNORE INTO settings(id,name,address) VALUES(1,'ร้านค้าของฉัน','');
 """
 
 def connect():
@@ -27,6 +28,24 @@ def connect():
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA foreign_keys=ON")
     return c
+
+def initialize(c):
+    c.executescript(SCHEMA + "CREATE TABLE IF NOT EXISTS bill_amount(bill INTEGER REFERENCES doc,invoice INTEGER REFERENCES doc,amount INTEGER NOT NULL,PRIMARY KEY(bill,invoice));")
+    c.execute("BEGIN IMMEDIATE")
+    columns = {
+        "settings": {"phone": "TEXT NOT NULL DEFAULT ''", "tax_id": "TEXT NOT NULL DEFAULT ''", "branch": "TEXT NOT NULL DEFAULT ''"},
+        "doc": {"customer_id": "INTEGER REFERENCES customer(id)", "party_address": "TEXT NOT NULL DEFAULT ''", "party_phone": "TEXT NOT NULL DEFAULT ''"},
+    }
+    for table, additions in columns.items():
+        existing = {row["name"] for row in c.execute(f"PRAGMA table_info({table})")}
+        for name, definition in additions.items():
+            if name not in existing:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+
+def customer_key(doc):
+    return ("member", doc["customer_id"]) if doc["customer_id"] else ("name", doc["party"])
+
 
 def need(ok, message):
     if not ok:
@@ -52,15 +71,30 @@ def update(c, a):
     op = a["op"]
     now = datetime.now().isoformat(timespec="seconds")
     if op == "settings":
-        c.execute("UPDATE settings SET name=?,address=? WHERE id=1",(field(a["name"]),field(a["address"],500,False)))
+        c.execute("UPDATE settings SET name=?,address=?,phone=?,tax_id=?,branch=? WHERE id=1", (
+            field(a["name"]), field(a["address"],500,False), field(a.get("phone",""),50,False),
+            field(a.get("tax_id",""),30,False), field(a.get("branch",""),100,False),
+        ))
+    elif op == "customer":
+        values = (field(a["name"]), field(a["address"],500,False), field(a["phone"],50,False))
+        if a.get("id"):
+            changed = c.execute("UPDATE customer SET name=?,address=?,phone=? WHERE id=?", (*values, number(a["id"]))).rowcount
+            need(changed, "ไม่พบสมาชิก")
+        else:
+            c.execute("INSERT INTO customer(name,address,phone) VALUES(?,?,?)", values)
     elif op == "product":
         c.execute("INSERT INTO product(sku,name,unit,price,minimum) VALUES(?,?,?,?,?)",(field(a["sku"],60),field(a["name"]),field(a["unit"],30),number(a["price"],True),number(a["minimum"])))
     elif op in ("IN","OUT","INV"):
         lines = a["lines"]
         need(isinstance(lines,list) and 1 <= len(lines) <= 100,"กรุณาเพิ่มรายการสินค้า")
-        party = field(a["party"],200,op!="OUT")
+        member_id = number(a["customer_id"]) if op == "INV" and a.get("customer_id") else None
+        member = c.execute("SELECT * FROM customer WHERE id=?", (member_id,)).fetchone() if member_id else None
+        need(member_id is None or member is not None, "ไม่พบสมาชิกที่เลือก")
+        party = member["name"] if member else field(a["party"],200,op!="OUT")
+        party_address = member["address"] if member else ""
+        party_phone = member["phone"] if member else ""
         due = date.fromisoformat(a["due"]).isoformat() if op=="INV" else ""
-        doc = c.execute("INSERT INTO doc(kind,party,note,created,due) VALUES(?,?,?,?,?)",(op,party,field(a["note"],500,False),now,due)).lastrowid
+        doc = c.execute("INSERT INTO doc(kind,party,note,created,due,customer_id,party_address,party_phone) VALUES(?,?,?,?,?,?,?,?)",(op,party,field(a["note"],500,False),now,due,member_id,party_address,party_phone)).lastrowid
         total = 0
         for row in lines:
             pid, qty = number(row["id"]), number(row["qty"])
@@ -78,8 +112,12 @@ def update(c, a):
         ids = list(dict.fromkeys(number(v) for v in a["ids"]))
         need(0<len(ids)<=100,"กรุณาเลือกใบแจ้งหนี้ 1–100 ใบ")
         docs = [c.execute("SELECT * FROM doc WHERE id=? AND kind='INV' AND total>paid AND id NOT IN (SELECT invoice FROM billed)",(i,)).fetchone() for i in ids]
-        need(all(docs) and len({d["party"] for d in docs})==1,"เลือกใบแจ้งหนี้ค้างชำระของลูกค้ารายเดียวที่ยังไม่ได้วางบิล")
-        doc = c.execute("INSERT INTO doc(kind,party,note,created,due,total) VALUES('BILL',?,'',?,'',?)",(docs[0]["party"],now,sum(d["total"]-d["paid"] for d in docs))).lastrowid
+        need(all(docs) and len({customer_key(d) for d in docs})==1,"เลือกใบแจ้งหนี้ค้างชำระของลูกค้ารายเดียวที่ยังไม่ได้วางบิล")
+        first = docs[0]
+        doc = c.execute(
+            "INSERT INTO doc(kind,party,note,created,due,total,customer_id,party_address,party_phone) VALUES('BILL',?,'',?,'',?,?,?,?)",
+            (first["party"], now, sum(d["total"]-d["paid"] for d in docs), first["customer_id"], first["party_address"], first["party_phone"]),
+        ).lastrowid
         for d in docs:
             c.execute("INSERT INTO billed VALUES(?,?)",(d["id"],doc))
             c.execute("INSERT INTO bill_amount VALUES(?,?,?)",(doc,d["id"],d["total"]-d["paid"]))
@@ -88,7 +126,8 @@ def update(c, a):
         amount = number(a["amount"],True)
         idx = number(a["id"])
         need(amount>0 and c.execute("UPDATE doc SET paid=paid+? WHERE id=? AND kind='INV' AND total-paid>=?",(amount,idx,amount)).rowcount,"กรุณาตรวจยอดรับชำระกับยอดค้าง")
-        c.execute("INSERT INTO payment(invoice,amount,created) VALUES(?,?,?)",(idx,amount,now))
+        receipt = c.execute("INSERT INTO payment(invoice,amount,created) VALUES(?,?,?)",(idx,amount,now)).lastrowid
+        return {"receipt": receipt}
     else:
         raise ValueError("ไม่รู้จักคำสั่ง")
     return {}
@@ -108,7 +147,7 @@ class Handler(BaseHTTPRequestHandler):
         if path=="/api":
             with connect() as c:
                 c.execute("BEGIN")
-                self.respond(200,{t:[dict(r) for r in c.execute("SELECT * FROM "+t)] for t in ("product","doc","line","bill_amount","payment","settings")})
+                self.respond(200,{t:[dict(r) for r in c.execute("SELECT * FROM "+t)] for t in ("product","doc","line","bill_amount","payment","settings","customer")})
         elif path in ("/","/ui.js","/style.css"):
             filename, mime = {"/":("index.html","text/html"),"/ui.js":("ui.js","application/javascript"),"/style.css":("style.css","text/css")}[path]
             self.respond(200,(ROOT/filename).read_bytes(),mime)
@@ -140,7 +179,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     with connect() as c:
-        c.executescript(SCHEMA+"CREATE TABLE IF NOT EXISTS bill_amount(bill INTEGER REFERENCES doc,invoice INTEGER REFERENCES doc,amount INTEGER NOT NULL,PRIMARY KEY(bill,invoice));")
+        initialize(c)
     server = ThreadingHTTPServer(("127.0.0.1",8765),Handler)
     url = "http://127.0.0.1:8765"
     print("Stockroom is running at",url,flush=True)

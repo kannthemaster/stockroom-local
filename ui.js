@@ -1,8 +1,8 @@
-const $=s=>document.querySelector(s);
+﻿const $=s=>document.querySelector(s);
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const cash=n=>(n/100).toLocaleString('th-TH',{minimumFractionDigits:2,maximumFractionDigits:2});
-const names={home:'ภาพรวมคลัง',stock:'สินค้าในคลัง',moves:'รับเข้า / เบิกออก',sales:'บิลขาย / ใบแจ้งหนี้',bills:'วางบิล',settings:'ข้อมูลร้าน'};
-const icons=['▦','▤','⇄','▧','▥','⚙'];
+const names={home:'ภาพรวมคลัง',stock:'สินค้าในคลัง',moves:'รับเข้า / เบิกออก',sales:'บิลขาย / ใบแจ้งหนี้',bills:'วางบิล',customers:'สมาชิก / ลูกค้า',settings:'ข้อมูลบริษัท'};
+const icons=['▦','▤','⇄','▧','▥','♙','⚙'];
 const kinds={IN:'ใบรับสินค้า',OUT:'ใบเบิกสินค้า',INV:'ใบแจ้งหนี้',BILL:'ใบวางบิล'};
 const code=d=>d.kind+'-'+String(d.id).padStart(5,'0');
 const day=s=>new Date(s.length===10?s+'T00:00:00':s).toLocaleDateString('th-TH',{day:'numeric',month:'short',year:'numeric'});
@@ -41,8 +41,17 @@ function render(){
  }else if(tab==='sales'){
  action=btnDoc('INV','＋ เปิดบิลขาย');body=panel('บัญชีลูกหนี้',table(['ใบแจ้งหนี้','ลูกค้า','ครบกำหนด','ยอดขาย','ค้างรับ (บาท)','จัดการ'],inv.map(d=>tr([act(code(d),'openDoc('+d.id+')'),esc(d.party),day(d.due),cash(d.total),cash(d.total-d.paid),d.total>d.paid?act('รับชำระ','payForm('+d.id+')'):'<span class="pill">ชำระครบ</span>'])),'ยังไม่มีบิลขาย'));
  }else if(tab==='bills'){action=act('＋ สร้างใบวางบิล','billForm()','primary');body=panel('รายการใบวางบิล',docsTable(docs.filter(d=>d.kind==='BILL')))}
- else{const s=db.settings[0];body=panel('ข้อมูลที่แสดงบนเอกสาร','<h3>'+esc(s.name)+'</h3><p>'+esc(s.address)+'</p><br>'+act('แก้ไขข้อมูลร้าน','settingsForm()'))}
+ else if(tab==='customers'){
+  action=act('＋ เพิ่มสมาชิก','customerForm()','primary');
+  body='<section class="panel"><input id="search" aria-label="ค้นหาลูกค้า" placeholder="ค้นหาชื่อ เบอร์โทร หรือรหัสสมาชิก"><div id="customers">'+customerTable(db.customer)+'</div></section>';
+ }else{
+  body=panel('หัวเอกสารบริษัท',companyHeader()+'<br>'+act('แก้ไขข้อมูลบริษัท','settingsForm()'));
+ }
  $('#page').innerHTML='<div class="title"><h1>'+names[tab]+'</h1><div class="actions">'+action+'</div></div>'+body;
+ if(tab==='customers')$('#search').oninput=e=>{
+  const term=e.target.value.trim().toLowerCase();
+  $('#customers').innerHTML=customerTable(db.customer.filter(c=>[memberCode(c.id),c.name,c.phone].some(value=>value.toLowerCase().includes(term))));
+ };
  if(tab==='stock')$('#search').oninput=e=>{const q=e.target.value.trim().toLowerCase();$('#products').innerHTML=stockTable(db.product.filter(p=>(p.sku+' '+p.name).toLowerCase().includes(q)))};
 }
 const closeModal=()=>$('#modal').close();
@@ -56,11 +65,59 @@ function form(title,body,payload,after){
 }
 const numAttrs='required min="0" max="10000000" step=".01"';
 function productForm(){form('เพิ่มสินค้า',input('รหัสสินค้า','sku','','text','required maxlength="60"')+input('ชื่อสินค้า','name')+'<div class="fields">'+input('หน่วยนับ','unit','ชิ้น','text','required maxlength="30"')+input('ราคาขาย (บาท)','price','0','number',numAttrs)+input('แจ้งเตือนเมื่อเหลือ','minimum','0','number','required min="0" step="1"')+'</div>',v=>({...v,op:'product'}))}
-function settingsForm(){const s=db.settings[0];form('ข้อมูลร้าน',input('ชื่อร้าน','name',s.name)+input('ที่อยู่ / ช่องทางติดต่อ','address',s.address,'text','maxlength="500"'),v=>({...v,op:'settings'}))}
+const memberCode=id=>'CUS-'+String(id).padStart(5,'0');
+const receiptCode=id=>'REC-'+String(id).padStart(5,'0');
+const customerKey=d=>d.customer_id?'member:'+d.customer_id:'name:'+d.party;
+
+function contactDetails(address,phone){
+ return (address?'<p class="document-address">'+esc(address)+'</p>':'')+(phone?'<p>โทร '+esc(phone)+'</p>':'');
+}
+function companyHeader(){
+ const company=db.settings[0];
+ const identity=[company.tax_id?'เลขประจำตัวผู้เสียภาษี '+company.tax_id:'',company.branch].filter(Boolean).join(' · ');
+ return '<div class="dochead"><h2>'+esc(company.name)+'</h2>'+contactDetails(company.address,company.phone)+(identity?'<p>'+esc(identity)+'</p>':'')+'</div>';
+}
+function addressInput(value=''){
+ return '<label>ที่อยู่<textarea name="address" maxlength="500" rows="3">'+esc(value)+'</textarea></label>';
+}
+function settingsForm(){
+ const c=db.settings[0];
+ form('แก้ไขหัวเอกสารบริษัท',input('ชื่อบริษัท / ร้านค้า','name',c.name)+addressInput(c.address)
+  +input('เบอร์โทร','phone',c.phone,'tel','maxlength="50"')
+  +'<div class="fields">'+input('เลขประจำตัวผู้เสียภาษี','tax_id',c.tax_id,'text','maxlength="30"')
+  +input('สำนักงานใหญ่ / สาขา','branch',c.branch,'text','maxlength="100"')+'</div>',
+  values=>({...values,op:'settings'}));
+}
+function customerTable(customers){
+ return table(['รหัสสมาชิก','ชื่อลูกค้า','ที่อยู่','เบอร์โทร',''],customers.map(c=>tr([
+  memberCode(c.id),esc(c.name),'<span class="document-address">'+esc(c.address)+'</span>',esc(c.phone),
+  act('แก้ไข','customerForm('+c.id+')')
+ ])),'ยังไม่มีสมาชิก');
+}
+function customerForm(id){
+ const c=db.customer.find(c=>c.id===id);
+ form(c?'แก้ไข '+memberCode(id):'เพิ่มสมาชิก',input('ชื่อลูกค้า','name',c?.name)+addressInput(c?.address)
+  +input('เบอร์โทร','phone',c?.phone,'tel','maxlength="50"'),values=>({...values,op:'customer',id}));
+}
+function memberSelect(){
+ return '<label>สมาชิก<select name="customer_id"><option value="">ลูกค้าทั่วไป / พิมพ์ชื่อเอง</option>'
+  +db.customer.map(c=>'<option value="'+c.id+'">'+esc(memberCode(c.id)+' · '+c.name+(c.phone?' · '+c.phone:''))+'</option>').join('')
+  +'</select></label><div id="member-details"></div>';
+}
 function transactionForm(k){
  if(!db.product.length){modal(kinds[k],'<p>เพิ่มสินค้าในคลังก่อนทำรายการ</p><br>'+act('＋ เพิ่มสินค้า','productForm()','primary'));return}
  const party=k==='INV'?'ชื่อลูกค้า':k==='IN'?'ผู้ส่งสินค้า / ร้านค้า':'ผู้เบิก';
- form(kinds[k],'<div class="fields">'+input(party,'party','','text',k==='OUT'?'maxlength="200"':'required maxlength="200"')+(k==='INV'?input('วันครบกำหนด','due',today(),'date'):'')+'</div><div id="lines"></div>'+act('＋ เพิ่มรายการ',"addLine('"+k+"')")+input('หมายเหตุ','note','','text','maxlength="500"')+'<b class="amount" id="sum"></b>',v=>({...v,op:k,lines:[...document.querySelectorAll('.item')].map(el=>({id:el.querySelector('select').value,qty:el.querySelector('.qty').value,price:el.querySelector('.price')?.value||0}))}),r=>openDoc(r.doc));
+ form(kinds[k],(k==='INV'?memberSelect():'')+'<div class="fields">'+input(party,'party','','text',k==='OUT'?'maxlength="200"':'required maxlength="200"')+(k==='INV'?input('วันครบกำหนด','due',today(),'date'):'')+'</div><div id="lines"></div>'+act('＋ เพิ่มรายการ',"addLine('"+k+"')")+input('หมายเหตุ','note','','text','maxlength="500"')+'<b class="amount" id="sum"></b>',v=>({...v,op:k,lines:[...document.querySelectorAll('.item')].map(el=>({id:el.querySelector('select').value,qty:el.querySelector('.qty').value,price:el.querySelector('.price')?.value||0}))}),r=>openDoc(r.doc));
+ if(k==='INV'){
+  const select=$('select[name=customer_id]');
+  const partyInput=$('input[name=party]');
+  select.onchange=()=>{
+   const member=db.customer.find(c=>c.id===Number(select.value));
+   partyInput.disabled=Boolean(member);
+   partyInput.closest('label').hidden=Boolean(member);
+   $('#member-details').innerHTML=member?contactDetails(member.address,member.phone):'';
+  };
+ }
  addLine(k);
 }
 function addLine(k){
@@ -74,16 +131,32 @@ function addLine(k){
 function billForm(){
  const unpaid=db.doc.filter(d=>d.kind==='INV'&&d.total>d.paid&&!db.bill_amount.some(b=>b.invoice===d.id));
  if(!unpaid.length){modal('สร้างใบวางบิล','<p>ยังไม่มีใบแจ้งหนี้ค้างชำระที่รอวางบิล</p>');return}
- const parties=[...new Set(unpaid.map(d=>d.party))];
- form('สร้างใบวางบิล','<label>ลูกค้า<select id="party">'+parties.map(p=>'<option>'+esc(p)+'</option>').join('')+'</select></label><div id="choices"></div>',()=>({op:'BILL',ids:[...document.querySelectorAll('#choices input:checked')].map(e=>e.value)}),r=>openDoc(r.doc));
- const choices=()=>{$('#choices').innerHTML=table(['เลือก','ใบแจ้งหนี้','ยอดค้าง (บาท)'],unpaid.filter(d=>d.party===$('#party').value).map(d=>tr(['<input type="checkbox" checked value="'+d.id+'" aria-label="'+code(d)+'">',code(d),cash(d.total-d.paid)])),'')};$('#party').onchange=choices;choices()
+ const parties=[...new Map(unpaid.map(d=>[customerKey(d),d])).entries()];
+ form('สร้างใบวางบิล','<label>ลูกค้า<select id="party">'+parties.map(([key,d])=>'<option value="'+esc(key)+'">'+esc(d.party+(d.customer_id?' · '+memberCode(d.customer_id):' · ลูกค้าทั่วไป'))+'</option>').join('')+'</select></label><div id="choices"></div>',()=>({op:'BILL',ids:[...document.querySelectorAll('#choices input:checked')].map(e=>e.value)}),r=>openDoc(r.doc));
+ const choices=()=>{$('#choices').innerHTML=table(['เลือก','ใบแจ้งหนี้','ยอดค้าง (บาท)'],unpaid.filter(d=>customerKey(d)===$('#party').value).map(d=>tr(['<input type="checkbox" checked value="'+d.id+'" aria-label="'+code(d)+'">',code(d),cash(d.total-d.paid)])),'')};$('#party').onchange=choices;choices()
 }
-function payForm(id){const d=findDoc(id);form('รับชำระ '+code(d),'<p>'+esc(d.party)+' · ค้างรับ ฿ '+cash(d.total-d.paid)+'</p>'+input('จำนวนเงินที่ได้รับ (บาท)','amount',(d.total-d.paid)/100,'number','required min=".01" step=".01" max="'+(d.total-d.paid)/100+'"'),v=>({...v,op:'pay',id}),()=>openDoc(id))}
+function payForm(id){const d=findDoc(id);form('รับชำระ '+code(d),'<p>'+esc(d.party)+' · ค้างรับ ฿ '+cash(d.total-d.paid)+'</p>'+input('จำนวนเงินที่ได้รับ (บาท)','amount',(d.total-d.paid)/100,'number','required min=".01" step=".01" max="'+(d.total-d.paid)/100+'"'),v=>({...v,op:'pay',id}),result=>openReceipt(result.receipt))}
 function openDoc(id){
- const d=findDoc(id),s=db.settings[0];
+ const d=findDoc(id);
  let detail=d.kind==='BILL'?table(['ใบแจ้งหนี้','ครบกำหนด','ยอดวางบิล (บาท)'],db.bill_amount.filter(b=>b.bill===id).map(b=>tr([code(findDoc(b.invoice)),day(findDoc(b.invoice).due),cash(b.amount)])),''):table(['สินค้า','จำนวน','หน่วย',...(d.kind==='OUT'?[]:['ราคา','รวม'])],db.line.filter(l=>l.doc===id).map(l=>{const p=findProduct(l.product);return tr([esc(p.sku+' · '+p.name),l.qty,esc(p.unit),...(d.kind==='OUT'?[]:[cash(l.price),cash(l.price*l.qty)])])}),'');
- let html='<div class="dochead"><h2>'+esc(s.name)+'</h2><p>'+esc(s.address)+'</p></div><div class="row"><h2>'+kinds[d.kind]+'</h2><b>'+code(d)+'</b></div><p>วันที่ '+day(d.created)+(d.due?' · ครบกำหนด '+day(d.due):'')+'</p><p>'+({INV:'ลูกค้า',BILL:'ลูกค้า',IN:'ผู้ส่งสินค้า',OUT:'ผู้เบิก'}[d.kind])+' '+esc(d.party)+'</p><br>'+detail+(d.kind==='OUT'?'':'<h3 class="amount">ยอดรวม ฿ '+cash(d.total)+'</h3>')+(d.note?'<p>หมายเหตุ '+esc(d.note)+'</p>':'');
+ let html=companyHeader()+'<div class="row"><h2>'+kinds[d.kind]+'</h2><b>'+code(d)+'</b></div><p>วันที่ '+day(d.created)+(d.due?' · ครบกำหนด '+day(d.due):'')+'</p><p>'+({INV:'ลูกค้า',BILL:'ลูกค้า',IN:'ผู้ส่งสินค้า',OUT:'ผู้เบิก'}[d.kind])+' '+esc(d.party)+'</p>'+contactDetails(d.party_address,d.party_phone)+'<br>'+detail+(d.kind==='OUT'?'':'<h3 class="amount">ยอดรวม ฿ '+cash(d.total)+'</h3>')+(d.note?'<p>หมายเหตุ '+esc(d.note)+'</p>':'');
  if(d.kind==='INV'){html+='<p class="amount">รับชำระแล้ว '+cash(d.paid)+' · คงค้าง '+cash(d.total-d.paid)+' บาท</p>';const pays=db.payment.filter(p=>p.invoice===id);if(pays.length)html+=table(['วันที่รับชำระ','จำนวนเงิน (บาท)'],pays.map(p=>tr([day(p.created),cash(p.amount)])),'')}
- $('#print').innerHTML=html;modal('รายละเอียดเอกสาร',html+'<br><div class="actions">'+act('พิมพ์ / บันทึก PDF','window.print()','primary')+(d.kind==='INV'&&d.total>d.paid?act('รับชำระ','payForm('+id+')'):'')+'</div>');
+ $('#print').innerHTML=html;
+ const receiptLinks=d.kind==='INV'?db.payment.filter(p=>p.invoice===id).map(p=>act('ใบเสร็จ '+receiptCode(p.id),'openReceipt('+p.id+')')).join(''):'';
+ modal('รายละเอียดเอกสาร',html+'<br><div class="actions">'+act('พิมพ์ / บันทึก PDF','window.print()','primary')+(d.kind==='INV'&&d.total>d.paid?act('รับชำระ','payForm('+id+')'):'')+receiptLinks+'</div>');
+}
+function openReceipt(id){
+ const payment=db.payment.find(p=>p.id===id);
+ const invoice=findDoc(payment.invoice);
+ const html=companyHeader()
+  +'<div class="row"><h2>ใบเสร็จรับเงิน</h2><b>'+receiptCode(id)+'</b></div>'
+  +'<p>วันที่รับเงิน '+day(payment.created)+'</p><p>ได้รับเงินจาก '+esc(invoice.party)+'</p>'
+  +contactDetails(invoice.party_address,invoice.party_phone)
+  +'<br>'+table(['อ้างอิงใบแจ้งหนี้','จำนวนเงิน (บาท)'],[tr([code(invoice),cash(payment.amount)])],'')
+  +'<h3 class="amount">ยอดรับเงิน ฿ '+cash(payment.amount)+'</h3>';
+ $('#print').innerHTML=html;
+ modal('รายละเอียดใบเสร็จ',html+'<br><div class="actions">'
+  +act('พิมพ์ / บันทึก PDF','window.print()','primary')
+  +act('เปิดใบแจ้งหนี้','openDoc('+invoice.id+')')+'</div>');
 }
 refresh().catch(e=>{$('#page').textContent=e.message});
