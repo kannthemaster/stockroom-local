@@ -1,4 +1,4 @@
-﻿import json
+import json
 import sqlite3
 import sys
 import webbrowser
@@ -20,6 +20,12 @@ CREATE TABLE IF NOT EXISTS payment(id INTEGER PRIMARY KEY, invoice INTEGER REFER
 CREATE TABLE IF NOT EXISTS request(token TEXT PRIMARY KEY,result TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS settings(id INTEGER PRIMARY KEY,name TEXT NOT NULL,address TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS customer(id INTEGER PRIMARY KEY, name TEXT NOT NULL, address TEXT NOT NULL, phone TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS category(id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE UNIQUE NOT NULL);
+INSERT OR IGNORE INTO category(name) VALUES('สีทาบ้าน'),('สีกาว'),('สีพื้นใหม่');
+CREATE TABLE IF NOT EXISTS loyalty(id INTEGER PRIMARY KEY CHECK(id=1), spend_per_point INTEGER NOT NULL, point_value INTEGER NOT NULL);
+INSERT OR IGNORE INTO loyalty VALUES(1,10000,100);
+CREATE TABLE IF NOT EXISTS points_entry(id INTEGER PRIMARY KEY, customer INTEGER NOT NULL REFERENCES customer, invoice INTEGER NOT NULL REFERENCES doc, kind TEXT NOT NULL, points INTEGER NOT NULL, created TEXT NOT NULL, UNIQUE(invoice,kind));
+CREATE INDEX IF NOT EXISTS points_customer ON points_entry(customer);
 INSERT OR IGNORE INTO settings(id,name,address) VALUES(1,'ร้านค้าของฉัน','');
 """
 
@@ -33,14 +39,19 @@ def initialize(c):
     c.executescript(SCHEMA + "CREATE TABLE IF NOT EXISTS bill_amount(bill INTEGER REFERENCES doc,invoice INTEGER REFERENCES doc,amount INTEGER NOT NULL,PRIMARY KEY(bill,invoice));")
     c.execute("BEGIN IMMEDIATE")
     columns = {
+        "line": {column: "TEXT NOT NULL DEFAULT ''" for column in ("unit", "sku", "name")},
+        "product": {"category_id": "INTEGER REFERENCES category(id)", "points_per_unit": "INTEGER"},
+
         "settings": {"phone": "TEXT NOT NULL DEFAULT ''", "tax_id": "TEXT NOT NULL DEFAULT ''", "branch": "TEXT NOT NULL DEFAULT ''"},
-        "doc": {"customer_id": "INTEGER REFERENCES customer(id)", "party_address": "TEXT NOT NULL DEFAULT ''", "party_phone": "TEXT NOT NULL DEFAULT ''"},
+        "doc": {"customer_id": "INTEGER REFERENCES customer(id)", "party_address": "TEXT NOT NULL DEFAULT ''", "party_phone": "TEXT NOT NULL DEFAULT ''", "discount": "INTEGER NOT NULL DEFAULT 0", "pending_points": "INTEGER NOT NULL DEFAULT 0"},
     }
     for table, additions in columns.items():
         existing = {row["name"] for row in c.execute(f"PRAGMA table_info({table})")}
         for name, definition in additions.items():
             if name not in existing:
                 c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+                if table == "line":
+                    c.execute(f"UPDATE line SET {name}=COALESCE((SELECT {name} FROM product WHERE id=line.product),'')")
 
 
 def customer_key(doc):
@@ -67,6 +78,15 @@ def number(value, money=False):
     except InvalidOperation:
         raise ValueError("กรุณากรอกตัวเลขให้ถูกต้อง")
 
+def award_points(c, invoice, now):
+    c.execute(
+        """INSERT OR IGNORE INTO points_entry(customer,invoice,kind,points,created)
+           SELECT customer_id,id,'earn',pending_points,? FROM doc
+           WHERE id=? AND customer_id IS NOT NULL AND pending_points>0 AND paid=total""",
+        (now, invoice),
+    )
+
+
 def update(c, a):
     op = a["op"]
     now = datetime.now().isoformat(timespec="seconds")
@@ -82,8 +102,29 @@ def update(c, a):
             need(changed, "ไม่พบสมาชิก")
         else:
             c.execute("INSERT INTO customer(name,address,phone) VALUES(?,?,?)", values)
+    elif op == "category":
+        name = field(a["name"], 80)
+        need(not c.execute("SELECT 1 FROM category WHERE name=?", (name,)).fetchone(), "มีหมวดหมู่นี้แล้ว")
+        c.execute("INSERT INTO category(name) VALUES(?)", (name,))
+    elif op == "loyalty":
+        spend = number(a["spend_per_point"], True)
+        value = number(a["point_value"], True)
+        need(spend > 0 and value > 0, "อัตราแต้มและส่วนลดต้องมากกว่าศูนย์")
+        c.execute("UPDATE loyalty SET spend_per_point=?,point_value=? WHERE id=1", (spend,value))
     elif op == "product":
-        c.execute("INSERT INTO product(sku,name,unit,price,minimum) VALUES(?,?,?,?,?)",(field(a["sku"],60),field(a["name"]),field(a["unit"],30),number(a["price"],True),number(a["minimum"])))
+        category = number(a["category_id"]) if a.get("category_id") else None
+        points = number(a["points_per_unit"]) if a.get("points_per_unit") not in (None, "") else None
+        values = (field(a["sku"],60), field(a["name"]), field(a["unit"],30),
+                  number(a["price"],True), number(a["minimum"]), category, points)
+        if a.get("id"):
+            changed = c.execute(
+                "UPDATE product SET sku=?,name=?,unit=?,price=?,minimum=?,category_id=?,points_per_unit=? WHERE id=?",
+                (*values, number(a["id"])),
+            ).rowcount
+            need(changed, "ไม่พบสินค้า")
+        else:
+            product = c.execute("INSERT INTO product(sku,name,unit,price,minimum,category_id,points_per_unit) VALUES(?,?,?,?,?,?,?)", values).lastrowid
+            return {"product": product}
     elif op in ("IN","OUT","INV"):
         lines = a["lines"]
         need(isinstance(lines,list) and 1 <= len(lines) <= 100,"กรุณาเพิ่มรายการสินค้า")
@@ -96,6 +137,8 @@ def update(c, a):
         due = date.fromisoformat(a["due"]).isoformat() if op=="INV" else ""
         doc = c.execute("INSERT INTO doc(kind,party,note,created,due,customer_id,party_address,party_phone) VALUES(?,?,?,?,?,?,?,?)",(op,party,field(a["note"],500,False),now,due,member_id,party_address,party_phone)).lastrowid
         total = 0
+        eligible_spend = 0
+        fixed_points = 0
         for row in lines:
             pid, qty = number(row["id"]), number(row["qty"])
             price = number(row["price"],True) if op!="OUT" else 0
@@ -103,10 +146,36 @@ def update(c, a):
             delta = qty if op=="IN" else -qty
             ok = c.execute("UPDATE product SET qty=qty+? WHERE id=? AND qty+? BETWEEN 0 AND 1000000000",(delta,pid,delta)).rowcount
             need(ok,"ยอดคงเหลือไม่เพียงพอ หรือจำนวนเกินขอบเขต")
-            c.execute("INSERT INTO line(doc,product,qty,price) VALUES(?,?,?,?)",(doc,pid,qty,price))
+            c.execute(
+                "INSERT INTO line(doc,product,qty,price,unit,sku,name) SELECT ?,id,?,?,unit,sku,name FROM product WHERE id=?",
+                (doc,qty,price,pid),
+            )
+            if member:
+                product_points = c.execute("SELECT points_per_unit FROM product WHERE id=?", (pid,)).fetchone()[0]
+                if product_points is None:
+                    eligible_spend += qty * price
+                else:
+                    fixed_points += qty * product_points
             total += qty*price
             need(total<=10**14,"ยอดเอกสารสูงเกินไป")
-        c.execute("UPDATE doc SET total=? WHERE id=?",(total,doc))
+        redeem = number(a.get("redeem", 0) or 0)
+        discount = 0
+        earned = 0
+        need(member or not redeem, "เลือกสมาชิกก่อนแลกแต้ม")
+        if member:
+            loyalty = c.execute("SELECT * FROM loyalty WHERE id=1").fetchone()
+            if redeem:
+                balance = c.execute("SELECT COALESCE(SUM(points),0) FROM points_entry WHERE customer=?", (member_id,)).fetchone()[0]
+                discount = redeem * loyalty["point_value"]
+                need(redeem <= balance and discount <= total, "แต้มไม่พอหรือส่วนลดเกินยอดสินค้า")
+                c.execute(
+                    "INSERT INTO points_entry(customer,invoice,kind,points,created) VALUES(?,?,'redeem',?,?)",
+                    (member_id,doc,-redeem,now),
+                )
+            eligible_discount = (discount * eligible_spend + total - 1) // total if total else 0
+            if total > discount:
+                earned = fixed_points + (eligible_spend - eligible_discount) // loyalty["spend_per_point"]
+        c.execute("UPDATE doc SET total=?,discount=?,pending_points=? WHERE id=?", (total-discount,discount,earned,doc))
         return {"doc":doc}
     elif op=="BILL":
         ids = list(dict.fromkeys(number(v) for v in a["ids"]))
@@ -127,6 +196,7 @@ def update(c, a):
         idx = number(a["id"])
         need(amount>0 and c.execute("UPDATE doc SET paid=paid+? WHERE id=? AND kind='INV' AND total-paid>=?",(amount,idx,amount)).rowcount,"กรุณาตรวจยอดรับชำระกับยอดค้าง")
         receipt = c.execute("INSERT INTO payment(invoice,amount,created) VALUES(?,?,?)",(idx,amount,now)).lastrowid
+        award_points(c, idx, now)
         return {"receipt": receipt}
     else:
         raise ValueError("ไม่รู้จักคำสั่ง")
@@ -147,7 +217,7 @@ class Handler(BaseHTTPRequestHandler):
         if path=="/api":
             with connect() as c:
                 c.execute("BEGIN")
-                self.respond(200,{t:[dict(r) for r in c.execute("SELECT * FROM "+t)] for t in ("product","doc","line","bill_amount","payment","settings","customer")})
+                self.respond(200,{t:[dict(r) for r in c.execute("SELECT * FROM "+t)] for t in ("product","doc","line","bill_amount","payment","settings","customer","category","loyalty","points_entry")})
         elif path in ("/","/ui.js","/style.css"):
             filename, mime = {"/":("index.html","text/html"),"/ui.js":("ui.js","application/javascript"),"/style.css":("style.css","text/css")}[path]
             self.respond(200,(ROOT/filename).read_bytes(),mime)
